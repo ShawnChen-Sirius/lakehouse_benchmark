@@ -1,0 +1,136 @@
+name: chDB historical Q1 GDB core comparison
+
+# The historical source, data, Python packages and debugger are shared;
+# only the chdb-core wheel version differs. No prepare or publish stage.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: onelake
+  cancel-in-progress: false
+
+env:
+  HISTORICAL_BENCH_SHA: 947f402c8f724ca244f2b11c4abf93008a973dc8
+  BENCH_ENGINE: chdb_iceberg
+  TPCDS_SF: "1"
+  PYTHONUNBUFFERED: "1"
+  FABRIC_WORKSPACE_ID: ${{ secrets.FABRIC_WORKSPACE_ID }}
+  FABRIC_LAKEHOUSE_ID: ${{ secrets.FABRIC_LAKEHOUSE_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+jobs:
+  compare:
+    name: Historical Q1 / core ${{ matrix.core }} / GDB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        core: ["26.7.3", "26.9.0"]
+    env:
+      CORE_VERSION: ${{ matrix.core }}
+      DIAGNOSTIC_DIR: ${{ github.workspace }}/diagnostics
+      PYTHONPATH: ${{ github.workspace }}/historical
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.HISTORICAL_BENCH_SHA }}
+          path: historical
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.14"
+
+      - name: Install debugger identically for both core versions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb binutils
+          gdb --version
+          ldd --version
+          uname -a
+
+      - name: Install original dependencies, overriding only the core wheel
+        run: |
+          python -m pip install -r requirements/chdb_historical_20260922.txt
+          python -m pip install --no-deps --force-reinstall "chdb-core==$CORE_VERSION"
+          python -m pip check
+
+      - name: Verify all versions and record binary identities
+        shell: bash
+        run: |
+          test "$(git -C historical rev-parse HEAD)" = "$HISTORICAL_BENCH_SHA"
+          mkdir -p diagnostics
+          python - <<'PY'
+          import hashlib
+          import importlib.metadata as metadata
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import subprocess
+          assert platform.python_version() == "3.12.14"
+          packages = {}
+          for line in Path("requirements/chdb_historical_20260922.txt").read_text().splitlines():
+              if not line or line.startswith("#"):
+                  continue
+              name, expected = line.split("==")
+              if name == "chdb-core":
+                  expected = os.environ["CORE_VERSION"]
+              actual = metadata.version(name)
+              assert actual == expected, (name, actual, expected)
+              packages[name] = actual
+          binaries = []
+          distribution = metadata.distribution("chdb-core")
+          for entry in distribution.files or []:
+              if ".so" not in entry.name:
+                  continue
+              binary = Path(distribution.locate_file(entry))
+              if not binary.is_file():
+                  continue
+              notes = subprocess.run(["readelf", "-n", str(binary)], capture_output=True, text=True)
+              binaries.append({
+                  "path": str(binary),
+                  "sha256": hashlib.file_digest(binary.open("rb"), "sha256").hexdigest(),
+                  "build_ids": [line.strip() for line in notes.stdout.splitlines() if "Build ID:" in line],
+              })
+          assert binaries, "No native chdb-core shared library found"
+          report = {"python": platform.python_version(), "source_sha": os.environ["HISTORICAL_BENCH_SHA"],
+                    "packages": packages, "binaries": binaries, "query": 1, "sf": 1}
+          Path("diagnostics/environment.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report, indent=2))
+          PY
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Run Q1 under GDB and capture signal stops
+        working-directory: historical
+        shell: bash
+        run: |
+          ulimit -c 0
+          timeout --signal=TERM --kill-after=30s 15m \
+            gdb -q -nx -batch -x "$GITHUB_WORKSPACE/.github/scripts/chdb_gdb_capture.py" \
+              --args python "$GITHUB_WORKSPACE/.github/scripts/chdb_historical_q1.py" 2>&1 \
+            | python "$GITHUB_WORKSPACE/.github/scripts/chdb_diagnostic_redact.py" \
+            | tee "$DIAGNOSTIC_DIR/gdb.log"
+
+      - name: Save only diagnostics, never a memory dump
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: chdb-gdb-core-${{ matrix.core }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
