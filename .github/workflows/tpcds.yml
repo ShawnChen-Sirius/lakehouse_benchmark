@@ -1,4 +1,5 @@
 name: tpcds bench
+# Register the fork's manual workflow for its own Fabric environment.
 
 # THE SECOND QUERY SUITE: the same job graph as bench.yml, on TPC-DS's 24 tables and 99
 # statements and the same shared scripts (BENCH_SUITE=tpcds picks the suite, bench/suite.py).

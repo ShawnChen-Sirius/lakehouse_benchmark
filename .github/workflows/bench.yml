@@ -1,4 +1,5 @@
 name: tpch bench
+# Register the fork's manual workflow for its own Fabric environment.
 
 # THE JOB GRAPH, and why it has this shape:
 #

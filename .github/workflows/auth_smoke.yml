@@ -1,4 +1,5 @@
 name: auth smoke
+# Register the fork's manual workflow for its own Fabric environment.
 
 # RUN THIS FIRST, and run it whenever anything about the credential changes.
 #
