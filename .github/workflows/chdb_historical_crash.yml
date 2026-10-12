@@ -1,0 +1,103 @@
+name: chDB historical crash reproduction
+
+# Run the original harness, query order and engine settings, not today's runner.
+# Only reads existing DS0001/DS0010 tables. No prepare or publish job exists here.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: onelake
+  cancel-in-progress: false
+
+env:
+  HISTORICAL_BENCH_SHA: 947f402c8f724ca244f2b11c4abf93008a973dc8
+  PYTHONUNBUFFERED: "1"
+  BENCH_SUITE: tpcds
+  BENCH_ENGINE: chdb_iceberg
+  FABRIC_WORKSPACE_ID: ${{ secrets.FABRIC_WORKSPACE_ID }}
+  FABRIC_LAKEHOUSE_ID: ${{ secrets.FABRIC_LAKEHOUSE_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+jobs:
+  reproduce:
+    name: chDB 4.4.0 / core 26.7.3 / SF=${{ matrix.sf }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        sf: ["1", "10"]
+    env:
+      TPCDS_SF: ${{ matrix.sf }}
+      PYTHONPATH: ${{ github.workspace }}/historical
+    steps:
+      - name: Check out the fork's dependency lock
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Check out the author's original benchmark snapshot from the fork
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.HISTORICAL_BENCH_SHA }}
+          path: historical
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.14"
+
+      - name: Install the exact historical Python dependencies
+        run: |
+          python -m pip install -r requirements/chdb_historical_20260922.txt
+          python -m pip check
+          python -m pip list --format=freeze
+
+      - name: Assert the tested versions and source revision
+        shell: bash
+        run: |
+          test "$(git -C historical rev-parse HEAD)" = "$HISTORICAL_BENCH_SHA"
+          python - <<'PY'
+          import importlib.metadata
+          import platform
+          expected = {"chdb": "4.4.0", "chdb-core": "26.7.3", "pyarrow": "25.0.1"}
+          assert platform.python_version() == "3.12.14", platform.python_version()
+          for name, wanted in expected.items():
+              actual = importlib.metadata.version(name)
+              print(f"{name}={actual}", flush=True)
+              assert actual == wanted, (name, actual, wanted)
+          print("Historical harness: original Q1-first, cold then warm; existing data only.")
+          PY
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Run the original TPC-DS harness
+        working-directory: historical
+        shell: bash
+        run: |
+          # Core dumps can contain the OneLake bearer; keep logs, never upload process memory.
+          ulimit -c 0
+          python .github/scripts/run_engine.py parts 2>&1 \
+            | sed -E 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/[REDACTED_JWT]/g' \
+            | tee "chdb-historical-sf${TPCDS_SF}.log"
+
+      - name: Keep diagnostic logs and any result rows, including on native abort
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: chdb-historical-sf${{ matrix.sf }}
+          path: |
+            historical/chdb-historical-sf${{ matrix.sf }}.log
+            historical/parts/*.json
+          if-no-files-found: warn
+          retention-days: 14
