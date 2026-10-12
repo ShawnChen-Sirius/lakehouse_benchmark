@@ -36,8 +36,33 @@ jobs:
           echo "DuckDB nightly run ${{ steps.duckdb.outputs.run-id }}"
           duckdb --version
 
+  pin-chdb-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      run-id: ${{ steps.core.outputs.run-id }}
+      head-sha: ${{ steps.core.outputs.head-sha }}
+      wheel-name: ${{ steps.core.outputs.wheel-name }}
+      wheel-sha256: ${{ steps.core.outputs.wheel-sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: core
+        name: Download newest successful main Linux x86_64 CI wheel
+        env:
+          GH_TOKEN: ${{ secrets.CHDB_CORE_ARTIFACT_TOKEN }}
+        run: python .github/scripts/resolve_chdb_core_ci.py
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pinned-chdb-core-wheel
+          path: |
+            ${{ runner.temp }}/chdb-core-ci/chdb_core-*.whl
+            ${{ runner.temp }}/chdb-core-ci/provenance.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
   benchmark:
-    needs: pin-duckdb
+    needs: [pin-duckdb, pin-chdb-core]
     runs-on: ubuntu-latest
     timeout-minutes: 55
     permissions:
@@ -66,10 +91,22 @@ jobs:
         if: matrix.engine != 'clickhouse_local_iceberg'
         run: pip install -r "requirements/${BENCH_ENGINE}.txt"
 
+      - uses: actions/download-artifact@v6
+        if: matrix.engine == 'chdb_iceberg'
+        with:
+          name: pinned-chdb-core-wheel
+          path: ${{ runner.temp }}/chdb-core-wheel
+
       - name: Match author's chDB wrapper and pin the fixed core
         if: matrix.engine == 'chdb_iceberg'
+        env:
+          EXPECTED_WHEEL_SHA256: ${{ needs.pin-chdb-core.outputs.wheel-sha256 }}
         run: |
-          pip install --force-reinstall --no-deps 'chdb==4.4.0' 'chdb-core==26.9.0'
+          pip install --force-reinstall --no-deps 'chdb==4.4.0'
+          WHEEL=$(find "$RUNNER_TEMP/chdb-core-wheel" -maxdepth 1 -name 'chdb_core-*.whl' -type f -print -quit)
+          test -n "$WHEEL"
+          test "$(sha256sum "$WHEEL" | cut -d' ' -f1)" = "$EXPECTED_WHEEL_SHA256"
+          pip install --force-reinstall --no-deps "$WHEEL"
           pip check
           pip show chdb chdb-core | grep -E '^(Name|Version):'
 
@@ -125,6 +162,14 @@ jobs:
             python .github/scripts/run_engine.py parts 2>&1 | tee "${BENCH_ENGINE}.log"
           fi
 
+      - name: Keep pinned core provenance beside its result
+        if: always() && matrix.engine == 'chdb_iceberg'
+        run: |
+          if [ -f "$RUNNER_TEMP/chdb-core-wheel/provenance.json" ]; then
+            mkdir -p parts
+            cp "$RUNNER_TEMP/chdb-core-wheel/provenance.json" parts/chdb-core-provenance.json
+          fi
+
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -133,4 +178,31 @@ jobs:
             parts/*.json
             ${{ matrix.engine }}.log
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 90
+
+  compare:
+    needs: [pin-duckdb, pin-chdb-core, benchmark]
+    if: ${{ always() && needs.benchmark.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: sf10-*
+          path: calibration/input
+      - name: Aggregate 12 runs and compare author's TPC-H SF10 history
+        run: |
+          python .github/scripts/summarize_sf10_calibration.py calibration/input calibration/output
+          cat calibration/output/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: sf10-four-engine-calibration-summary
+          path: calibration/output/
+          if-no-files-found: warn
+          retention-days: 90

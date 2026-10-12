@@ -86,6 +86,29 @@ gh workflow run candidate_engine.yml -f candidate=starrocks    # needs CH0010 an
 smoke test's `sql` phase run on every push. A `schedule:` block is left commented out at the top
 of `bench.yml`.
 
+### Four-engine SF10 calibration on this personal fork
+
+`four_engine_sf10_calibration.yml` runs DuckDB, Polars, chDB and ClickHouse Local against the
+existing `CH0010` namespace, three independent cold rounds each, serially on `ubuntu-latest`.
+It never calls `prepare` or `publish`: missing data is a failure rather than an implicit write,
+and CI never commits or pushes results. DuckDB's usable nightly is selected once, Polars uses
+the same pinned main wheel as the normal benchmark, and ClickHouse Local uses a checksummed
+official stable binary. chDB uses wrapper 4.4.0 and the newest **successful main Linux x86_64
+CI wheel** from `chdb-io/chdb-core`, pinned once for all three rounds. The resolver records the
+upstream run, commit and wheel SHA-256; it never falls back to PyPI.
+
+The upstream Actions artifact requires cross-repository authentication. Add a fork Actions
+secret named `CHDB_CORE_ARTIFACT_TOKEN` with **Actions: read** on `chdb-io/chdb-core` (or an
+equivalent authorized token); do not paste its value into an issue, workflow input or log.
+The upstream artifact includes ~2.3 GB of libraries and debug data, so the pin job downloads
+it once and republishes only the selected wheel within this run. If the secret or permission is
+missing, the job fails clearly before any benchmark starts.
+
+The workflow uploads every engine/round's JSON and log, plus a combined `summary.md`,
+`summary.json` and per-query `rounds.csv`, as Actions artifacts retained for 90 days. The
+combined table also appears in the run's Job Summary. This is *not permanent git storage*;
+a later user-approved commit would be required to put results in the repository.
+
 ## Cost
 
 OneLake storage, reads and Fabric CU are billed to **your** workspace, not to GitHub. The data sizes
