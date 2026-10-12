@@ -1,0 +1,136 @@
+name: Four-engine SF10 calibration (3 cold rounds)
+
+# Read-only OneLake experiment. Unlike bench.yml, there is no prepare or publish
+# job: CH0010 must already exist, and nothing commits results to main.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onelake
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONUNBUFFERED: '1'
+  BENCH_SUITE: tpch
+  TPCH_SF: '10'
+  FABRIC_WORKSPACE_ID: ${{ secrets.FABRIC_WORKSPACE_ID }}
+  FABRIC_LAKEHOUSE_ID: ${{ secrets.FABRIC_LAKEHOUSE_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+jobs:
+  pin-duckdb:
+    runs-on: ubuntu-latest
+    outputs:
+      run-id: ${{ steps.duckdb.outputs.run-id }}
+      version: ${{ steps.duckdb.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: duckdb
+        uses: ./.github/actions/duckdb-nightly
+      - run: |
+          echo "DuckDB nightly run ${{ steps.duckdb.outputs.run-id }}"
+          duckdb --version
+
+  benchmark:
+    needs: pin-duckdb
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      # One pipe to OneLake at a time. An independent runner/process/cache
+      # for every measurement, interleaved by round to expose time drift.
+      max-parallel: 1
+      matrix:
+        round: [1, 2, 3]
+        engine: [duckdb_iceberg, polars_iceberg, chdb_iceberg, clickhouse_local_iceberg]
+    name: ${{ matrix.engine }} round ${{ matrix.round }}
+    env:
+      BENCH_ENGINE: ${{ matrix.engine }}
+      AZURE_TRANSPORT_OPTION_TYPE: curl
+      CURL_CA_INFO: /etc/ssl/certs/ca-certificates.crt
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install the author's engine dependencies
+        if: matrix.engine != 'clickhouse_local_iceberg'
+        run: pip install -r "requirements/${BENCH_ENGINE}.txt"
+
+      - name: Match author's chDB wrapper and pin the fixed core
+        if: matrix.engine == 'chdb_iceberg'
+        run: |
+          pip install --force-reinstall --no-deps 'chdb==4.4.0' 'chdb-core==26.9.0'
+          pip check
+          pip show chdb chdb-core | grep -E '^(Name|Version):'
+
+      - name: Install one DuckDB nightly for all three rounds
+        if: matrix.engine == 'duckdb_iceberg'
+        uses: ./.github/actions/duckdb-nightly
+        with:
+          run-id: ${{ needs.pin-duckdb.outputs.run-id }}
+
+      - name: Install ClickHouse Local 26.9.17.8 with pinned SHA-512
+        if: matrix.engine == 'clickhouse_local_iceberg'
+        shell: bash
+        run: |
+          pip install 'azure-identity>=1.19' 'psutil>=6'
+          curl --fail --location --retry 3 \
+            -o "$RUNNER_TEMP/clickhouse-common-static-26.9.17.8-amd64.tgz" \
+            'https://github.com/ClickHouse/ClickHouse/releases/download/v26.9.17.8-stable/clickhouse-common-static-26.9.17.8-amd64.tgz'
+          cd "$RUNNER_TEMP"
+          echo '6fc6b563c18d140d6f7d96eb0ffdf90fb28b1730ea009dade2d11586a4f234619a891ab920a389f9af06cd5b12719026f1ffda633bd999754f7eaefe1a57e458  clickhouse-common-static-26.9.17.8-amd64.tgz' | sha512sum --check
+          mkdir -p clickhouse-install clickhouse-bin
+          tar -xf clickhouse-common-static-26.9.17.8-amd64.tgz -C clickhouse-install
+          ln -s "$RUNNER_TEMP/clickhouse-install/clickhouse-common-static-26.9.17.8/usr/bin/clickhouse" clickhouse-bin/clickhouse
+          echo "$RUNNER_TEMP/clickhouse-bin" >> "$GITHUB_PATH"
+
+      - name: Record machine and binary versions
+        shell: bash
+        run: |
+          uname -a
+          lscpu | grep -E 'Architecture:|CPU\(s\):|Model name:'
+          free -h
+          df -h "$RUNNER_TEMP"
+          python --version
+          if [ "$BENCH_ENGINE" = clickhouse_local_iceberg ]; then
+            clickhouse local --version
+          elif [ "$BENCH_ENGINE" = duckdb_iceberg ]; then
+            duckdb --version
+          else
+            pip list --format=freeze | grep -Ei '^(chdb|chdb-core|polars|polars-runtime-32|pyiceberg)='
+          fi
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Run author's complete 22-query cold pass
+        shell: bash
+        run: |
+          if [ "$BENCH_ENGINE" = clickhouse_local_iceberg ]; then
+            python .github/scripts/clickhouse_local_tpch.py parts 2>&1 | tee "${BENCH_ENGINE}.log"
+          else
+            python .github/scripts/run_engine.py parts 2>&1 | tee "${BENCH_ENGINE}.log"
+          fi
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: sf10-${{ matrix.engine }}-round-${{ matrix.round }}
+          path: |
+            parts/*.json
+            ${{ matrix.engine }}.log
+          if-no-files-found: warn
+          retention-days: 14
