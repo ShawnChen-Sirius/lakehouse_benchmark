@@ -109,6 +109,17 @@ The workflow uploads every engine/round's JSON and log, plus a combined `summary
 combined table also appears in the run's Job Summary. This is *not permanent git storage*;
 a later user-approved commit would be required to put results in the repository.
 
+`four_engine_io_diagnosis.yml` is a separate **single-run** follow-up. It stages the exact
+`CH0010` Iceberg Parquet objects on one ephemeral 4-CPU/16-GB GitHub runner, checks snapshots
+before/after, then executes all 22 queries locally and through OneLake for all four engines on
+that same machine. Download time is separate. It records per-query wall/CPU/approximate peak
+RSS/kernel disk I/O for the three library adapters, ClickHouse Local's CLI query timers plus
+whole-child CPU and unattributed process wall, and a fixed CPU-only control before and after.
+The same source data is read by both scenarios, but local Parquet bypasses Iceberg catalog and
+may be page-cached: remote minus local is *not* an exact network timer. Only small JSON/CSV/
+Markdown diagnostics are uploaded as 90-day Actions artifacts; raw Parquet, bearer tokens and
+per-sample logs are never uploaded. No result publishing or repository push runs in this job.
+
 ## Cost
 
 OneLake storage, reads and Fabric CU are billed to **your** workspace, not to GitHub. The data sizes
