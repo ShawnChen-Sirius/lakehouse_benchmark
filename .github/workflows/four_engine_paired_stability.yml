@@ -1,0 +1,225 @@
+name: Four-engine paired SF10 stability (no engine profiling)
+
+# Three independent fresh runners per engine. In each job: cold OneLake first,
+# then stage original Parquet outside the timer, then local files on that same
+# runner. This avoids warming OneLake with a 2.38 GiB staging download before
+# the measured remote cold pass. No Parquet files or bearer tokens are uploaded.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onelake
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  PYTHONUNBUFFERED: '1'
+  TPCH_SF: '10'
+  AZURE_TRANSPORT_OPTION_TYPE: curl
+  CURL_CA_INFO: /etc/ssl/certs/ca-certificates.crt
+  FABRIC_WORKSPACE_ID: ${{ secrets.FABRIC_WORKSPACE_ID }}
+  FABRIC_LAKEHOUSE_ID: ${{ secrets.FABRIC_LAKEHOUSE_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+jobs:
+  pin-duckdb:
+    runs-on: ubuntu-latest
+    outputs:
+      run-id: ${{ steps.duckdb.outputs.run-id }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: duckdb
+        uses: ./.github/actions/duckdb-nightly
+      - run: duckdb --version
+
+  pin-chdb-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      wheel-sha256: ${{ steps.core.outputs.wheel-sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: core
+        env:
+          GH_TOKEN: ${{ secrets.CHDB_CORE_ARTIFACT_TOKEN }}
+        run: python .github/scripts/resolve_chdb_core_ci.py
+      - uses: actions/upload-artifact@v6
+        with:
+          name: paired-pinned-chdb-core-wheel
+          path: |
+            ${{ runner.temp }}/chdb-core-ci/chdb_core-*.whl
+            ${{ runner.temp }}/chdb-core-ci/provenance.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+  pair:
+    needs: [pin-duckdb, pin-chdb-core]
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        round: [1, 2, 3]
+        engine: [duckdb_iceberg, polars_iceberg, chdb_iceberg, clickhouse_local_iceberg]
+    name: ${{ matrix.engine }} paired round ${{ matrix.round }}
+    env:
+      BENCH_ENGINE: ${{ matrix.engine }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install same engine and original data-catalog helpers
+        run: |
+          pip install -r requirements/catalog.txt 'psutil>=6'
+          if [ "$BENCH_ENGINE" != clickhouse_local_iceberg ]; then
+            pip install -r "requirements/${BENCH_ENGINE}.txt"
+          fi
+
+      - uses: actions/download-artifact@v6
+        if: matrix.engine == 'chdb_iceberg'
+        with:
+          name: paired-pinned-chdb-core-wheel
+          path: ${{ runner.temp }}/chdb-core-wheel
+
+      - name: Pin chDB wrapper and same main CI wheel for all rounds
+        if: matrix.engine == 'chdb_iceberg'
+        env:
+          EXPECTED_SHA: ${{ needs.pin-chdb-core.outputs.wheel-sha256 }}
+        run: |
+          pip install --force-reinstall --no-deps 'chdb==4.4.0'
+          WHEEL=$(find "$RUNNER_TEMP/chdb-core-wheel" -maxdepth 1 -name 'chdb_core-*.whl' -type f -print -quit)
+          test -n "$WHEEL"
+          test "$(sha256sum "$WHEEL" | cut -d' ' -f1)" = "$EXPECTED_SHA"
+          pip install --force-reinstall --no-deps "$WHEEL"
+          pip check
+          mkdir -p diagnosis
+          cp "$RUNNER_TEMP/chdb-core-wheel/provenance.json" diagnosis/core-provenance.json
+
+      - uses: ./.github/actions/duckdb-nightly
+        if: matrix.engine == 'duckdb_iceberg'
+        with:
+          run-id: ${{ needs.pin-duckdb.outputs.run-id }}
+
+      - name: Pin official ClickHouse Local 26.9.17.8
+        if: matrix.engine == 'clickhouse_local_iceberg'
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            -o "$RUNNER_TEMP/clickhouse-common-static-26.9.17.8-amd64.tgz" \
+            'https://github.com/ClickHouse/ClickHouse/releases/download/v26.9.17.8-stable/clickhouse-common-static-26.9.17.8-amd64.tgz'
+          cd "$RUNNER_TEMP"
+          echo '6fc6b563c18d140d6f7d96eb0ffdf90fb28b1730ea009dade2d11586a4f234619a891ab920a389f9af06cd5b12719026f1ffda633bd999754f7eaefe1a57e458  clickhouse-common-static-26.9.17.8-amd64.tgz' | sha512sum --check
+          mkdir -p clickhouse-install clickhouse-bin
+          tar -xf clickhouse-common-static-26.9.17.8-amd64.tgz -C clickhouse-install
+          ln -s "$RUNNER_TEMP/clickhouse-install/clickhouse-common-static-26.9.17.8/usr/bin/clickhouse" clickhouse-bin/clickhouse
+          echo "$RUNNER_TEMP/clickhouse-bin" >> "$GITHUB_PATH"
+
+      - name: Record machine and dependency identity
+        run: |
+          mkdir -p diagnosis
+          lscpu | grep -E 'Architecture:|CPU\(s\):|Model name:'
+          free -h
+          df -h "$RUNNER_TEMP"
+          python --version
+          pip list --format=freeze > diagnosis/python-packages.txt
+          if [ "$BENCH_ENGINE" = duckdb_iceberg ]; then duckdb --version; fi
+          if [ "$BENCH_ENGINE" = clickhouse_local_iceberg ]; then clickhouse local --version; fi
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: CPU control before remote cold run
+        run: python .github/scripts/cpu_control.py diagnosis/cpu-control-before.json
+
+      - name: Run OneLake cold FIRST, no profiler or 500-ms sampler
+        continue-on-error: true
+        run: |
+          python .github/scripts/io_diagnosis.py --timing-only \
+            --engine "$BENCH_ENGINE" --scenario remote \
+            --data "$RUNNER_TEMP/tpch-sf10-source" \
+            --out "diagnosis/${BENCH_ENGINE}-remote.json"
+
+      - name: Stage identical raw Parquet AFTER the remote result
+        if: always()
+        continue-on-error: true
+        run: |
+          python .github/scripts/download_tpch_parquet.py \
+            "$RUNNER_TEMP/tpch-sf10-source" diagnosis/manifest.json
+
+      - name: Run local Parquet on SAME runner, no profiler or sampler
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f diagnosis/manifest.json ]; then
+            python .github/scripts/io_diagnosis.py --timing-only \
+              --engine "$BENCH_ENGINE" --scenario local \
+              --data "$RUNNER_TEMP/tpch-sf10-source" \
+              --out "diagnosis/${BENCH_ENGINE}-local.json"
+          fi
+
+      - name: CPU control after paired run
+        if: always()
+        run: python .github/scripts/cpu_control.py diagnosis/cpu-control-after.json
+
+      - name: Verify source snapshot did not change
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f diagnosis/manifest.json ]; then
+            python .github/scripts/download_tpch_parquet.py \
+              --verify diagnosis/manifest.json \
+              --verify-output diagnosis/snapshot-verification.json
+          fi
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: paired-sf10-${{ matrix.engine }}-round-${{ matrix.round }}
+          path: diagnosis/
+          if-no-files-found: warn
+          retention-days: 90
+
+  summarize:
+    needs: [pin-duckdb, pin-chdb-core, pair]
+    if: ${{ always() && needs.pair.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: paired-sf10-*-round-*
+          path: paired-input
+      - name: Compare local and OneLake stability separately
+        run: |
+          status=0
+          python .github/scripts/summarize_paired_stability.py paired-input paired-report || status=$?
+          if [ -f paired-report/report.md ]; then
+            cat paired-report/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: paired-sf10-three-round-summary
+          path: paired-report/
+          if-no-files-found: warn
+          retention-days: 90

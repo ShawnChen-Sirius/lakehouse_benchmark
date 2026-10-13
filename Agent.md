@@ -120,6 +120,18 @@ may be page-cached: remote minus local is *not* an exact network timer. Only sma
 Markdown diagnostics are uploaded as 90-day Actions artifacts; raw Parquet, bearer tokens and
 per-sample logs are never uploaded. No result publishing or repository push runs in this job.
 
+`four_engine_paired_stability.yml` is the no-profiler, three-round gate before deeper
+profiling. Its 12 serial jobs each use a fresh 4-CPU/16-GB runner, execute the author's
+OneLake cold pass first, stage the same original Parquet outside query timing, and run the
+local pass on that *same* runner. Both scenarios use timing-only mode (no process sampler
+or native engine profiler). The DuckDB nightly and chdb-core main CI wheel are pinned once
+for the whole workflow. Snapshots, row counts, versions, package manifests and CPU-only
+controls must match before an engine gets a stability verdict. Screening thresholds are
+CV <= 10% and max-min/median <= 20% separately for local and remote; the raw values remain
+available even when unstable. Staging reads roughly 2.55 GB per job from OneLake; none of
+the Parquet files are uploaded or committed. The aggregate JSON/CSV/Markdown and 12 job
+artifacts are kept in Actions for 90 days, without any automatic result push.
+
 ## Cost
 
 OneLake storage, reads and Fabric CU are billed to **your** workspace, not to GitHub. The data sizes

@@ -122,6 +122,20 @@ class Meter:
         self._thread.join(timeout=2)
 
 
+class TimingOnlyMeter:
+    """No profiler, sampler or process counters in stability runs."""
+
+    engine = None
+
+    def measure(self, fn) -> tuple[dict, object]:
+        start = time.perf_counter()
+        value = fn()
+        return {"wall_seconds": round(time.perf_counter() - start, 5)}, value
+
+    def close(self) -> None:
+        pass
+
+
 def local_engine(name: str, cfg: TpchConfig, data: Path):
     paths = {table: data / table / "*.parquet" for table in cfg.TABLES}
     if any(not list((data / table).glob("*.parquet")) for table in cfg.TABLES):
@@ -138,8 +152,10 @@ def local_engine(name: str, cfg: TpchConfig, data: Path):
     raise ValueError(name)
 
 
-def library_run(name: str, scenario: str, cfg: TpchConfig, data: Path) -> dict:
-    meter = Meter()
+def library_run(
+    name: str, scenario: str, cfg: TpchConfig, data: Path, *, timing_only: bool = False
+) -> dict:
+    meter = TimingOnlyMeter() if timing_only else Meter()
     engine = None
     result = {"queries": [], "status": "running"}
     started = time.perf_counter()
@@ -295,6 +311,7 @@ def main() -> int:
     parser.add_argument("--scenario", choices=("local", "remote"), required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--timing-only", action="store_true")
     args = parser.parse_args()
     cfg = TpchConfig.from_env()
     start = time.perf_counter()
@@ -302,7 +319,13 @@ def main() -> int:
         if args.engine == "clickhouse_local_iceberg":
             result = clickhouse_run(args.scenario, cfg, args.data)
         else:
-            result = library_run(args.engine, args.scenario, cfg, args.data)
+            result = library_run(
+                args.engine,
+                args.scenario,
+                cfg,
+                args.data,
+                timing_only=args.timing_only,
+            )
     except Exception as exc:  # noqa: BLE001 - do not print token-bearing native exceptions
         result = {"status": "error", "queries": [], "error": scrub.scrub_exc(exc)}
     result.update(
@@ -314,6 +337,7 @@ def main() -> int:
             "logical_cpus": psutil.cpu_count(),
             "memory_bytes": psutil.virtual_memory().total,
             "overall_wall_seconds": round(time.perf_counter() - start, 5),
+            "profiling_enabled": not args.timing_only,
         }
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)

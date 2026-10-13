@@ -49,3 +49,13 @@ def test_process_tree_delta_and_cpu_wall_ratio():
     assert result["voluntary_context_switches"] == 3
     assert result["involuntary_context_switches"] == 2
     assert result["rss_peak_bytes_sampled"] == 2_000_000
+
+
+def test_timing_only_meter_does_not_collect_process_metrics():
+    meter = module.TimingOnlyMeter()
+    result, value = meter.measure(lambda: 42)
+    assert value == 42
+    assert result["wall_seconds"] >= 0
+    assert "cpu_seconds" not in result
+    assert "rss_peak_bytes_sampled" not in result
+    meter.close()
