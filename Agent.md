@@ -132,6 +132,26 @@ available even when unstable. Staging reads roughly 2.55 GB per job from OneLake
 the Parquet files are uploaded or committed. The aggregate JSON/CSV/Markdown and 12 job
 artifacts are kept in Actions for 90 days, without any automatic result push.
 
+`cross_engine_q7_profile.yml` is the **separate, targeted follow-up**, not another
+timing baseline. It uses the exact chdb-core and DuckDB wheels from the successful
+paired run, stages the same raw Parquet bytes on a single 4-CPU runner, and runs the
+complete 22-query sequence locally and through OneLake for DuckDB, Polars and chDB.
+The job first repeats all eight suites (including ClickHouse Local) *without* profiling on the same runner
+to establish fair lateral speed ratios. Only then does a separate full-sequence pass
+collect extra plan/counter data for Q1–Q3, Q7 and Q21. Q7/Q21 enable chDB's query
+and processor profiles solely for those statements; the bearer-bearing catalog DDL
+is executed while query logging is off. DuckDB JSON profiles, ClickHouse system logs,
+raw SQL/plan text, source paths and data files stay on ephemeral runner storage.
+Only bounded sanitized operator/plan structure, ProfileEvents, CPU/wall counters and
+small result digests are uploaded. ClickHouse Local contributes CLI per-query wall
+timers and whole-process CPU/unattributed wall, not a native per-query operator profile;
+do not assign that CPU or unattributed time to any one query or to Fabric.
+Polars 2.0 removed LazyFrame.profile for streaming,
+so it contributes optimized plan structure and process CPU/wall only. The report uses
+the same-runner unprofiled passes for engine speed ratios and the earlier three
+**unprofiled** paired-run medians as a stability cross-check; timings
+inside this profiler run must never be presented as a new performance ranking.
+
 ## Cost
 
 OneLake storage, reads and Fabric CU are billed to **your** workspace, not to GitHub. The data sizes
