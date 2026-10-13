@@ -224,8 +224,7 @@ def summarize(pairs: list[dict], rows: list[dict], problems: list[str]) -> dict:
             "local": scenarios["local"],
             "remote": scenarios["remote"],
             "verdict": verdict,
-            "versions": [p["remote"].get("version") if p["remote"] else None
-                         for p in selected],
+            "versions": [p["remote"].get("version") if p["remote"] else None for p in selected],
             "package_sha256": [p["packages_sha256"] for p in selected],
             "cpu_models": [p["remote"].get("cpu_model") if p["remote"] else None for p in selected],
             "cpu_control_drift_percent": [p.get("cpu_control_drift_percent") for p in selected],

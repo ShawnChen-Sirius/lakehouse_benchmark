@@ -128,9 +128,7 @@ def summarize(directory: Path) -> tuple[dict, list[dict]]:
                     "remote_rss_peak_bytes_sampled": right.get("rss_peak_bytes_sampled"),
                     "local_voluntary_context_switches": left.get("voluntary_context_switches"),
                     "remote_voluntary_context_switches": right.get("voluntary_context_switches"),
-                    "local_involuntary_context_switches": left.get(
-                        "involuntary_context_switches"
-                    ),
+                    "local_involuntary_context_switches": left.get("involuntary_context_switches"),
                     "remote_involuntary_context_switches": right.get(
                         "involuntary_context_switches"
                     ),
