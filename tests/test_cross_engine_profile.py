@@ -85,3 +85,22 @@ def test_query_log_profile_maps_exact_id_and_excludes_raw_sql():
     assert result["processors"]["groups"][0]["input_wait_us_sum"] == 600
     assert "Secret" not in json.dumps(result)
     assert "eyJsecret" not in json.dumps(result)
+
+
+def test_duckdb_json_profile_enables_format_before_json_output(tmp_path):
+    class Connection:
+        def __init__(self):
+            self.statements = []
+
+        def sql(self, statement):
+            if "profiling_output" in statement and not self.statements:
+                raise RuntimeError("JSON profiler format has not been selected")
+            self.statements.append(statement)
+
+    connection = Connection()
+    output = tmp_path / "q7.json"
+    module.enable_duckdb_json_profile(connection, output)
+    assert connection.statements == [
+        "PRAGMA enable_profiling='json'",
+        f"PRAGMA profiling_output='{output}'",
+    ]

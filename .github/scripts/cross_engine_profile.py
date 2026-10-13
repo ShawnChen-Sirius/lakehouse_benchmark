@@ -198,6 +198,12 @@ def _plan(engine, name: str, sql: str) -> dict:
     return plan_features(raw)
 
 
+def enable_duckdb_json_profile(conn, output: Path) -> None:
+    """The output extension is validated against the currently enabled format."""
+    conn.sql("PRAGMA enable_profiling='json'")
+    conn.sql(f"PRAGMA profiling_output='{output}'")
+
+
 def profile_one(name: str, scenario: str, cfg: TpchConfig, data: Path) -> dict:
     meter = Meter()
     engine = None
@@ -254,8 +260,7 @@ def profile_one(name: str, scenario: str, cfg: TpchConfig, data: Path) -> dict:
                     / (f"{scenario}-q{number}.json")
                 )
                 duck_file.parent.mkdir(parents=True, exist_ok=True)
-                engine._conn.sql(f"PRAGMA profiling_output='{duck_file}'")
-                engine._conn.sql("PRAGMA enable_profiling='json'")
+                enable_duckdb_json_profile(engine._conn, duck_file)
             metrics, output = meter.measure(lambda sql=sql: _full_output(engine, name, sql))
             target.update(metrics)
             target["rows"] = len(output)
